@@ -28,6 +28,7 @@ import re
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, Type, Union
 
 from absl import logging
+import clu.metrics
 import numpy as np
 from packaging import version
 from seqio import metrics as metrics_lib
@@ -781,8 +782,7 @@ class CacheDatasetPlaceholder(object):
 
 # ================================ Tasks =======================================
 
-MetricFnCallable = Callable[..., Mapping[str, Union[metrics_lib.MetricValue,
-                                                    float]]]
+MetricFnCallable = metrics_lib.MetricFnCallable
 
 
 class Task(DatasetProviderBase):
@@ -796,6 +796,7 @@ class Task(DatasetProviderBase):
       preprocessors: Optional[Sequence[Callable[..., tf.data.Dataset]]] = None,
       postprocess_fn: Optional[Callable[..., Any]] = None,
       metric_fns: Optional[Sequence[MetricFnCallable]] = None,
+      metric_objs: Optional[Sequence[clu.metrics.Metric]] = None,
       shuffle_buffer_size: Optional[int] = SHUFFLE_BUFFER_SIZE):
     """Task constructor.
 
@@ -822,6 +823,8 @@ class Task(DatasetProviderBase):
         - (targets, predictions, aux_values) - Note that
             `aux_values` refers to a dictionary of auxiliary values that the
             model assigned to each sequence.
+        metric_fns are being deprecated, please use metric_objs instead.
+      metric_objs: list(Metric instances), an optional list of Metric objects.
       shuffle_buffer_size: an optional integer to set the shuffle buffer size.
         If None, shuffling will be disallowed.
     """
@@ -829,8 +832,14 @@ class Task(DatasetProviderBase):
       raise ValueError(
           "Task name '%s' contains invalid characters. Must match regex: %s" %
           (name, _VALID_TASK_NAME_REGEX.pattern))
-
+    # Convert metric_fns into metric_objs for backward compatibility.
     metric_fns = metric_fns or []
+    metric_objs = metric_objs or []
+    metric_objs += [
+        metrics_lib.LegacyMetricClu.empty(mf, postprocess_fn)
+        for mf in metric_fns
+    ]
+    self._metric_objs = metric_objs
     self._predict_metric_fns = []
     self._predict_with_aux_metric_fns = []
     self._score_metric_fns = []
@@ -900,6 +909,11 @@ class Task(DatasetProviderBase):
   @property
   def name(self) -> str:
     return self._name
+
+  @property
+  def metric_objs(self) -> Sequence[clu.metrics.Metric]:
+    """List of all metric objects."""
+    return self._metric_objs
 
   @property
   def metric_fns(self) -> Sequence[MetricFnCallable]:
@@ -1255,10 +1269,11 @@ class TaskRegistry(DatasetProviderRegistry):
                                                     tf.data.Dataset]]] = None,
           postprocess_fn: Optional[Callable[..., Any]] = None,
           metric_fns: Optional[Sequence[MetricFnCallable]] = None,
+          metric_objs: Optional[Sequence[clu.metrics.Metric]] = None,
           **kwargs) -> Task:
     """See `Task` constructor for docstring."""
     return super().add(name, Task, name, source, output_features, preprocessors,
-                       postprocess_fn, metric_fns, **kwargs)
+                       postprocess_fn, metric_fns, metric_objs, **kwargs)
 
   @classmethod
   def get(cls, name) -> Task:
