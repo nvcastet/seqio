@@ -1129,12 +1129,16 @@ class _GrainRandomMapFn(_RandomMapTransform):
 
   # Path for SeqIO; preserves legacy logic to manage seeds and differs in
   # seed-management behavior in Grain.
-  def __call__(self, dataset: tf.data.Dataset, *args, **kwargs):
+  def __call__(
+      self, dataset: tf.data.Dataset, map_seed: tf.Tensor, *args, **kwargs
+  ):
     global _NEXT_MAP_SEED
-    if _NEXT_MAP_SEED is None:
+    if not map_seed:
+      map_seed = _NEXT_MAP_SEED
+    if map_seed is None:
       random_ds_seeds = ((None, None),) * self.num_seeds
     else:
-      random_ds_seeds = np.arange(_NEXT_MAP_SEED, _NEXT_MAP_SEED +
+      random_ds_seeds = np.arange(map_seed, map_seed +
                                   2 * self.num_seeds).reshape(-1, 2)
       random_ds_seeds = tuple(tuple(s) for s in random_ds_seeds)
       _NEXT_MAP_SEED += 2 * self.num_seeds
