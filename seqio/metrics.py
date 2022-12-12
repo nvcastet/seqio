@@ -109,14 +109,20 @@ MetricFnCallable = Callable[..., Mapping[str, Union[MetricValue, float]]]
 class Metric(clu.metrics.Metric):
   """Base Metric class for seqio evaluation."""
 
-  model_output_type: ModelOutputType
+  @staticmethod
+  def model_output_type() -> ModelOutputType:
+    """Determines the type of model output this metric needs."""
 
+    raise NotImplementedError("Must override model_output_type()")
+
+  @classmethod
   def from_model_output(
-      self,
+      cls,
       inputs: Sequence[Mapping[str, Any]],
       model_output: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]],
       features: Mapping[str, utils.Feature],
-      target_field_name: str = "targets") -> "Metric":
+      target_field_name: str = "targets",
+      mask: Optional[np.ndarray] = None) -> "Metric":
     """Creates a `seqio.Metric` from model outputs.
 
     Args:
@@ -124,6 +130,8 @@ class Metric(clu.metrics.Metric):
       model_output: Model output computed by model functions.
       features: Output features defined in seqio.Task.
       target_field_name: Field name of the target sequence.
+      mask: A boolean array to indicate which example in the inputs are included
+        for metric evaluation.
 
     Returns:
       An instance of Metric.
@@ -135,97 +143,129 @@ class Metric(clu.metrics.Metric):
 
 
 # TODO(kehanghan): consider using CollectingMetric for LegacyMetric.
-@flax.struct.dataclass
-class LegacyMetric(Metric):
-  """Metric class for legacy use-case where metric fn is supplied."""
-
-  _metric_fn: MetricFnCallable
-  _postprocess_fn: Callable[..., Any]
-  metric_fn_kwargs: Dict[str, Any]
-  targets_and_inferences: Dict[str, Any]
+class LegacyMetricFactory:
+  """Makes LegacyMetric from metric functions."""
 
   @classmethod
-  def empty(cls, metric_fn, postprocess_fn) -> "LegacyMetric":
-    pos_args = tuple(
-        key
-        for key, param in inspect.signature(metric_fn).parameters.items()
-        if param.default == inspect.Parameter.empty)
-    if pos_args == ("targets", "scores"):
-      model_output_type = ModelOutputType.SCORE
-    elif pos_args == ("targets", "predictions"):
-      model_output_type = ModelOutputType.PREDICTION
-    elif pos_args == ("targets", "predictions", "aux_values"):
-      model_output_type = ModelOutputType.PREDICTION_WITH_AUX
-    else:
-      raise ValueError(
-          "Metric functions must have positional arguments matching either "
-          "('targets', 'scores'), ('targets', 'predictions') or "
-          "('targets', 'predictions', 'aux_values'). "
-          f"Got: {pos_args}")
+  def from_metric_fn(cls,
+                     metric_fn: MetricFnCallable,
+                     postprocess_fn: Optional[Callable[..., Any]] = None):
+    """Constructs `LegacyMetric` from `metric_fn` and `postprocess_fn`.
 
-    return cls(
-        _metric_fn=metric_fn,
-        _postprocess_fn=postprocess_fn,
-        model_output_type=model_output_type,
-        metric_fn_kwargs={},
-        targets_and_inferences={})
+    Example:
 
-  def postprocess_fn(self, targets_or_predictions: Any,
-                     **postprocess_kwargs) -> Any:
-    """Applies the postprocessing to targets or predictions."""
-    if self._postprocess_fn:
-      return self._postprocess_fn(targets_or_predictions, **postprocess_kwargs)
-    return targets_or_predictions
+    ```
+    squad_cls = LegacyMetricFactory.from_metric_fn(
+        metric_fn=t5_metrics.squd,
+        postprocess_fn=t5_postprocessors.qa)
+    ```
 
-  def from_model_output(
-      self,
-      inputs: Sequence[Mapping[str, Any]],
-      model_output: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]],
-      features: Mapping[str, utils.Feature],
-      target_field_name: str = "targets") -> "LegacyMetric":
+    Args:
+      metric_fn: Function used to compute metric.
+      postprocess_fn: Function used to process targets (vocab decoded) and
+        predictions (vocab decoded) before feeding into metric_fn.
 
-    # Postprocesses the targets here.
-    postprocessed_targets = []
-    for ex in inputs:
-      pretokenized_target_field_name = target_field_name + "_pretokenized"
-      if pretokenized_target_field_name in ex:
-        target = ex[pretokenized_target_field_name]
-      else:
-        target = features[target_field_name].vocabulary.decode(
-            list(ex[target_field_name]))
-      if isinstance(target, bytes):
-        target = target.decode("utf-8")
+    Returns:
+      A `Metric` that calls `metric_fn` and `postprocess_fn` in its
+      `.from_model_output()`.
+    """
 
-      postprocessed_targets.append(
-          self.postprocess_fn(target, example=ex, is_target=True))
+    @flax.struct.dataclass
+    class LegacyMetric(Metric):
+      """Wrapper LegacyMetric class that runs metric_fn."""
 
-    self.metric_fn_kwargs["targets"] = postprocessed_targets
-    self.targets_and_inferences["targets"] = postprocessed_targets
+      metric_fn_kwargs: Dict[str, Any]
+      targets_and_inferences: Dict[str, Any]
 
-    if self.model_output_type == ModelOutputType.SCORE:
-      self.metric_fn_kwargs["scores"] = model_output
-      self.targets_and_inferences["score"] = model_output
-    else:
-      vocab = features[target_field_name].vocabulary
-      if self.model_output_type == ModelOutputType.PREDICTION_WITH_AUX:
-        self.metric_fn_kwargs["aux_values"] = model_output[1]
-        self.targets_and_inferences["aux_value"] = model_output[1]
-        predictions = [vocab.decode(tokens) for tokens in model_output[0]]
-      elif self.model_output_type == ModelOutputType.PREDICTION:
-        predictions = [vocab.decode(tokens) for tokens in model_output]
-      self.targets_and_inferences["output"] = predictions
+      @classmethod
+      def postprocess(cls, targets_or_predictions: Any,
+                      **postprocess_kwargs) -> Any:
+        """Applies the postprocessing to targets or predictions."""
+        if postprocess_fn:
+          return postprocess_fn(targets_or_predictions, **postprocess_kwargs)
+        return targets_or_predictions
 
-      # Postprocesses the predictions here.
-      postprocessed_predictions = [
-          self.postprocess_fn(p, example=ex, is_target=False)
-          for ex, p in zip(inputs, predictions)
-      ]
+      @staticmethod
+      def model_output_type() -> ModelOutputType:
+        pos_args = tuple(
+            key
+            for key, param in inspect.signature(metric_fn).parameters.items()
+            if param.default == inspect.Parameter.empty)
+        if pos_args == ("targets", "scores"):
+          model_output_type = ModelOutputType.SCORE
+        elif pos_args == ("targets", "predictions"):
+          model_output_type = ModelOutputType.PREDICTION
+        elif pos_args == ("targets", "predictions", "aux_values"):
+          model_output_type = ModelOutputType.PREDICTION_WITH_AUX
+        else:
+          raise ValueError(
+              "Metric functions must have positional arguments matching either "
+              "('targets', 'scores'), ('targets', 'predictions') or "
+              "('targets', 'predictions', 'aux_values'). "
+              f"Got: {pos_args}")
 
-      self.metric_fn_kwargs["predictions"] = postprocessed_predictions
-      self.targets_and_inferences["prediction"] = postprocessed_predictions
+        return model_output_type
 
-    return self
+      @classmethod
+      def empty(cls) -> Metric:
+        return cls(metric_fn_kwargs={},
+                   targets_and_inferences={})
 
-  def compute(self):
-    return self._metric_fn(**self.metric_fn_kwargs)
+      @classmethod
+      def from_model_output(
+          cls,
+          inputs: Sequence[Mapping[str, Any]],
+          model_output: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]],
+          features: Mapping[str, utils.Feature],
+          target_field_name: str = "targets",
+          mask: Optional[np.ndarray] = None) -> Metric:
+
+        # Postprocesses the targets here.
+        postprocessed_targets = []
+        for ex in inputs:
+          pretokenized_target_field_name = target_field_name + "_pretokenized"
+          if pretokenized_target_field_name in ex:
+            target = ex[pretokenized_target_field_name]
+          else:
+            target = features[target_field_name].vocabulary.decode(
+                list(ex[target_field_name]))
+          if isinstance(target, bytes):
+            target = target.decode("utf-8")
+
+          postprocessed_targets.append(
+              cls.postprocess(target, example=ex, is_target=True))
+
+        metric_fn_kwargs, targets_and_inferences = {}, {}
+        metric_fn_kwargs["targets"] = postprocessed_targets
+        targets_and_inferences["targets"] = postprocessed_targets
+
+        if cls.model_output_type() == ModelOutputType.SCORE:
+          metric_fn_kwargs["scores"] = model_output
+          targets_and_inferences["score"] = model_output
+        else:
+          vocab = features[target_field_name].vocabulary
+          if cls.model_output_type() == ModelOutputType.PREDICTION_WITH_AUX:
+            metric_fn_kwargs["aux_values"] = model_output[1]
+            targets_and_inferences["aux_value"] = model_output[1]
+            predictions = [vocab.decode(tokens) for tokens in model_output[0]]
+          elif cls.model_output_type() == ModelOutputType.PREDICTION:
+            predictions = [vocab.decode(tokens) for tokens in model_output]
+          targets_and_inferences["output"] = predictions
+
+          # Postprocesses the predictions here.
+          postprocessed_predictions = [
+              cls.postprocess(p, example=ex, is_target=False)
+              for ex, p in zip(inputs, predictions)
+          ]
+
+          metric_fn_kwargs["predictions"] = postprocessed_predictions
+          targets_and_inferences["prediction"] = postprocessed_predictions
+
+        return cls(metric_fn_kwargs=metric_fn_kwargs,
+                   targets_and_inferences=targets_and_inferences)
+
+      def compute(self):
+        return metric_fn(**self.metric_fn_kwargs)
+
+    return LegacyMetric
 

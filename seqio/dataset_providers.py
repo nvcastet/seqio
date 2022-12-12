@@ -838,7 +838,7 @@ class Task(DatasetProviderBase):
     metric_objs = metric_objs or []
     if metric_fns:
       metric_objs += [
-          metrics_lib.LegacyMetric.empty(mf, postprocess_fn)
+          metrics_lib.LegacyMetricFactory.from_metric_fn(mf, postprocess_fn)
           for mf in metric_fns
       ]
     self._metric_objs = metric_objs
