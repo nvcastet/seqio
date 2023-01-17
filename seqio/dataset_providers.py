@@ -1324,9 +1324,14 @@ class Task(DatasetProviderBase):
       shard_data_source = (
           len(self.source.list_shards(split=split)) >= shard_info.num_shards
       )
+      hybrid_shard_data_source = (
+          not shard_data_source and shard_info.num_shards % len(self.source.list_shards(split=split)) == 0
+        )
+
       logging.info(
-          "Sharding at the %s: %d of %d",
-          "data source" if shard_data_source else "examples",
+          "Sharding at %s: %d of %d",
+          "the data source" if shard_data_source else "both the data source and the examples"
+          if hybrid_shard_data_source else "examples",
           shard_info.index,
           shard_info.num_shards,
       )
@@ -1339,6 +1344,18 @@ class Task(DatasetProviderBase):
       ds = source.get_dataset(
           split=split, shuffle=shuffle, seed=seed, shard_info=shard_info
       )
+    elif hybrid_shard_data_source:
+      source_shards = len(self.source.list_shards(split=split))
+      example_shards = shard_info.num_shards // source_shards
+      source_shard_info = ShardInfo(
+          index=shard_info.index // example_shards, num_shards=source_shards
+      )
+      # Shard first at the source (e.g. list of shard files)
+      ds = source.get_dataset(
+          split=split, shuffle=shuffle, seed=seed, shard_info=source_shard_info
+      )
+      # Then, shard inside source element (e.g. inside a shard file)
+      ds = ds.shard(example_shards, shard_info.index % example_shards)
     else:
       ds = source.get_dataset(split=split, shuffle=shuffle, seed=seed)
       ds = ds.shard(shard_info.num_shards, shard_info.index)
